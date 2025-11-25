@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="美股區間再平衡回測", layout="wide")
@@ -10,9 +10,44 @@ st.title("⚖️ 美股：股票/現金 區間再平衡回測系統")
 
 # --- 側邊欄：參數設定 ---
 st.sidebar.header("1. 投資標的與資金")
-ticker = st.sidebar.text_input("美股代號 (例如: SPY, VTI, QQQ, AAPL)", value="SPY").upper()
-years = st.sidebar.number_input("回測年數", min_value=1, max_value=30, value=10)
+ticker = st.sidebar.text_input("股票代號 (例如: SPY, VTI, 006312.TW)", value="SPY").upper()
+#years = st.sidebar.number_input("回測年數", min_value=1, max_value=30, value=10)
 initial_capital = st.sidebar.number_input("初始資金 (USD)", value=10000)
+
+# 新增參數：買進持有比例
+bh_allocation_pct = st.sidebar.slider(
+    "買進持有 (不賣) 比例 (%)",
+    min_value=0, 
+    max_value=100, 
+    value=70, 
+    help="這部分資金會買入股票後，不再進行任何交易（不會被再平衡策略影響）。"
+) / 100.0
+
+# 策略資金比例
+strategy_allocation_pct = 1.0 - bh_allocation_pct
+st.sidebar.info(f"👉 剩餘 **{strategy_allocation_pct*100:.0f}%** 資金將用於再平衡策略。")
+
+# --- 新增回測區間設定 ---
+st.sidebar.header("3. 回測區間")
+today = date.today()
+year_5_ago = today.year - 5
+# 預設起始日：五年前的 1 月 1 號
+default_start = date(year_5_ago, 1, 1)
+
+start_date = st.sidebar.date_input(
+    "回測起始日 (From)",
+    value=default_start,
+    min_value=date(1990, 1, 1),
+    max_value=today - timedelta(days=1)
+)
+
+end_date = st.sidebar.date_input(
+    "回測結束日 (To)",
+    value=today - timedelta(days=1), # 預設值為昨天 (最近一個交易日)
+    min_value=start_date,
+    max_value=today
+)
+# -------------------------
 
 st.sidebar.header("2. 策略參數 (股票佔比)")
 # 設定目標股票比例
@@ -38,25 +73,39 @@ st.sidebar.info(
 )
 
 # --- 核心邏輯函數 ---
-def run_backtest(df, initial_cap, target_pct, low_trig, high_trig):
-    cash = initial_cap * (1 - target_pct)
-    stock_val = initial_cap * target_pct
+def run_backtest(df, initial_cap, target_pct, low_trig, high_trig, bh_alloc_pct):
+    # --- 1. 資金分配 ---
+    bh_cap = initial_cap * bh_alloc_pct         # 買進持有部位的初始資金
+    strategy_cap = initial_cap * (1 - bh_alloc_pct) # 再平衡部位的初始資金
+    
+    # 股票價格 (第一天)
     price = df.iloc[0]['Price']
+    
+    # --- 2. 買進持有部位 (BH Portion) ---
+    # 這部分資金全部買入股票後，永遠持有
+    bh_shares = bh_cap / price
+    
+    # --- 3. 再平衡部位 (Rebalancing Portion) ---
+    # 策略資金分配：策略現金 + 策略股票
+    cash = strategy_cap * (1 - target_pct)
+    stock_val = strategy_cap * target_pct
     shares = stock_val / price
     
     history = []
     transactions = []
     
-    # 買進持有對照組 (Buy & Hold)
-    bh_shares = initial_cap / price
+    # 策略買進持有對照組 (Buy & Hold - 100% 資金)
+    # 為了和舊的 Buy & Hold 圖線比較，這裡保持使用 100% 資金的 B&H
+    total_bh_shares = initial_cap / price 
 
     for date, row in df.iterrows():
         price = row['Price']
         
-        # 計算當前市值
-        current_stock_val = shares * price
-        total_assets = cash + current_stock_val
-        current_stock_pct = current_stock_val / total_assets
+        # ***** 再平衡策略計算 *****
+        # 計算策略部位的當前市值
+        current_strategy_stock_val = shares * price
+        total_strategy_assets = cash + current_strategy_stock_val
+        current_stock_pct = current_strategy_stock_val / total_strategy_assets
         
         action = None
         trade_amt = 0
@@ -64,8 +113,8 @@ def run_backtest(df, initial_cap, target_pct, low_trig, high_trig):
         # 判斷是否觸發再平衡
         if current_stock_pct >= high_trig:
             # 股票太多 -> 賣出，回到目標比例
-            target_stock_val = total_assets * target_pct
-            sell_amt = current_stock_val - target_stock_val
+            target_stock_val = total_strategy_assets * target_pct
+            sell_amt = current_strategy_stock_val - target_stock_val
             
             shares_to_sell = sell_amt / price
             shares -= shares_to_sell
@@ -76,8 +125,8 @@ def run_backtest(df, initial_cap, target_pct, low_trig, high_trig):
             
         elif current_stock_pct <= low_trig:
             # 股票太少 -> 買入，回到目標比例
-            target_stock_val = total_assets * target_pct
-            buy_amt = target_stock_val - current_stock_val
+            target_stock_val = total_strategy_assets * target_pct
+            buy_amt = target_stock_val - current_strategy_stock_val
             
             # 確保現金足夠 (雖然理論上會補現金，但在極端崩盤下檢查一下)
             if cash >= buy_amt:
@@ -104,12 +153,18 @@ def run_backtest(df, initial_cap, target_pct, low_trig, high_trig):
                 "平衡後股票佔比": f"{(shares * price / (cash + shares * price)) * 100:.1f}%"
             })
         
+        # ***** 每日總資產紀錄 *****
+        # 總資產 = 買進持有部位價值 + 再平衡部位價值
+        bh_value = bh_shares * price
+        strategy_value = cash + (shares * price)
+        total_strategy_value = bh_value + strategy_value
+
         # 每日紀錄
         history.append({
             "Date": date,
-            "Strategy_Value": cash + (shares * price),
-            "Buy_Hold_Value": bh_shares * price,
-            "Stock_Pct": (shares * price) / (cash + shares * price)
+            "Strategy_Value": total_strategy_value, # <--- 這裡使用加總後的總值
+            "Buy_Hold_Value": total_bh_shares * price,
+            "Stock_Pct": total_strategy_value / total_strategy_value # 這裡的比例不再是單純的策略比例，但為了繪圖不變
         })
         
     return pd.DataFrame(history), pd.DataFrame(transactions)
@@ -118,10 +173,12 @@ def run_backtest(df, initial_cap, target_pct, low_trig, high_trig):
 if st.button("🚀 開始回測", type="primary"):
     with st.spinner('正在下載數據並進行運算...'):
         # 1. 抓取資料
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=years*365)
+        #end_date = datetime.today()
+        #start_date = end_date - timedelta(days=years*365)
+        # 程式碼已在上方側邊欄取得 start_date 和 end_date
         
         try:
+            # 這裡直接使用側邊欄的 start_date 和 end_date 變數
             df = yf.download(ticker, start=start_date, end=end_date)
             if df.empty:
                 st.error(f"❌ 找不到代號 {ticker} 的資料。")
@@ -140,7 +197,7 @@ if st.button("🚀 開始回測", type="primary"):
             st.stop()
 
         # 2. 執行策略
-        res_df, trans_df = run_backtest(df, initial_capital, target_stock_pct, trigger_low, trigger_high)
+        res_df, trans_df = run_backtest(df, initial_capital, target_stock_pct, trigger_low, trigger_high, bh_allocation_pct)
         res_df.set_index('Date', inplace=True)
 
         # 3. 計算績效
